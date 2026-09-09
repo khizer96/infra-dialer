@@ -1,0 +1,2 @@
+- [Android VPN consent](android-vpn-consent.md) — cached consent is only an optimization; native permission failures must invalidate it after Settings revocation.
+- [Expo publish startup](expo-publish-startup.md) — run the dependency-free mobile production server directly because publish-time package pruning can break pnpm-mediated startup.

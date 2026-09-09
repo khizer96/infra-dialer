@@ -1,0 +1,27 @@
+kind = "mobile"
+previewPath = "/"
+title = "WireGuard Dialer"
+description = "An Android app that lets users enter a WireGuard config endpoint, retrieve their tunnel profile, and connect or disconnect securely from the app."
+version = "1.0.0"
+id = "artifacts/wireguard-dialer"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 19291
+
+[services.development]
+run = "pnpm --filter @workspace/wireguard-dialer run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/wireguard-dialer", "run", "build" ]
+run = [ "node", "artifacts/wireguard-dialer/server/serve.js" ]
+
+[services.production.health.startup]
+path = "/"
+
+[services.env]
+PORT = "19291"
+BASE_PATH = "/"
