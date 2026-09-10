@@ -40,7 +40,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..6807d01cae679c3998116a11efef4dd8
  
 +    @ReactMethod
 +    fun requestVpnPermission(promise: Promise) {
-+        val activity = currentActivity
++        val activity = reactApplicationContext.currentActivity
 +        if (activity == null) {
 +            promise.reject("VPN_PERMISSION_ERROR", "Android activity is unavailable")
 +            return
