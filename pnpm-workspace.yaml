@@ -147,3 +147,5 @@ overrides:
 patchedDependencies:
   # query-string 7 expects CommonJS; support decode-uri-component 0.5's default export.
   query-string@7.1.3: patches/query-string@7.1.3.patch
+  # Expose Android VpnService.prepare() to JavaScript and await its activity result.
+  react-native-wireguard-vpn@1.0.22: patches/react-native-wireguard-vpn@1.0.22.patch

@@ -1,11 +1,7 @@
-import { NativeModules } from 'react-native';
-import { Platform } from 'react-native';
-import Constants from 'expo-constants';
-import * as IntentLauncher from 'expo-intent-launcher';
+import { NativeModules, Platform } from 'react-native';
 import type { WireGuardConfig } from './wireguard';
-import { readLocal, removeLocal, writeLocal } from './storage';
+import { removeLocal, writeLocal } from './storage';
 
-const ANDROID_VPN_CONSENT_ACTION = 'android.net.VpnService';
 const ANDROID_VPN_CONSENT_KEY = 'wireguard.androidVpnConsent';
 
 type TunnelStatus = {
@@ -17,6 +13,7 @@ type TunnelStatus = {
 
 type WireGuardNativeModule = {
   initialize: () => Promise<void>;
+  requestVpnPermission: () => Promise<boolean>;
   connect: (config: WireGuardConfig) => Promise<void>;
   disconnect: () => Promise<void>;
   getStatus: () => Promise<TunnelStatus>;
@@ -48,39 +45,29 @@ export async function clearAndroidVpnPermissionCache(): Promise<void> {
 }
 
 /**
- * The installed WireGuard module does not expose Android's VpnService.prepare().
- * Keep the one-time consent result in secure storage, then use Expo's intent
- * launcher to await the system confirmation activity when consent is needed.
- *
- * The native module remains the source of truth after a user revokes VPN
- * access in Android Settings. The connect path clears this cache when the
- * native error identifies a permission failure, allowing the next retry to
- * request consent again.
+ * Android only allows VPN consent through VpnService.prepare(). The native
+ * module owns that activity result and reports whether the user approved it.
  */
 export async function ensureAndroidVpnPermission(): Promise<void> {
   if (Platform.OS !== 'android') return;
 
-  if (await readLocal(ANDROID_VPN_CONSENT_KEY) === 'granted') return;
-
-  const packageName = Constants.expoConfig?.android?.package;
-  if (!packageName) {
+  const module = getWireGuardModule();
+  if (!module?.requestVpnPermission) {
     throw new VpnPermissionError(
-      'The Android app package is unavailable, so VPN permission cannot be requested.',
+      'This Android build does not include VPN permission support. Rebuild and reinstall the app.',
     );
   }
 
-  let result: IntentLauncher.IntentLauncherResult;
+  let granted: boolean;
   try {
-    result = await IntentLauncher.startActivityAsync(ANDROID_VPN_CONSENT_ACTION, {
-      extra: { [ANDROID_VPN_CONSENT_ACTION]: packageName },
-    });
+    granted = await module.requestVpnPermission();
   } catch {
     throw new VpnPermissionError(
       'Android could not open the VPN permission prompt. Try connecting again from the installed app.',
     );
   }
 
-  if (result.resultCode !== IntentLauncher.ResultCode.Success) {
+  if (!granted) {
     await removeLocal(ANDROID_VPN_CONSENT_KEY);
     throw new VpnPermissionError(
       'VPN permission was not granted. Allow the Android VPN connection request to connect.',
