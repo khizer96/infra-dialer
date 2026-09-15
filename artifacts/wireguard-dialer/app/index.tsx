@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Linking,
   Pressable,
   Platform,
@@ -22,6 +23,9 @@ import {
   type WireGuardConfig,
 } from '@/lib/wireguard';
 import {
+  buildProfileEndpoint,
+  normalizeProfileHost,
+  parseStoredHosts,
   profileRequestErrorMessage,
   refreshWireGuardProfile,
   validateProfileRequest,
@@ -32,12 +36,15 @@ import {
   getNativeTunnelStatus,
   getWireGuardModule,
   isNativeVpnPermissionError,
+  subscribeToNativeTunnelStatus,
   VpnPermissionError,
 } from '@/lib/tunnel';
 import { readLocal, removeLocal, writeLocal } from '@/lib/storage';
 import { generateWireGuardKeyPair } from '@/lib/keypair';
 
-const ENDPOINT_KEY = 'wireguard.endpoint';
+const LEGACY_ENDPOINT_KEY = 'wireguard.endpoint';
+const HOSTS_KEY = 'wireguard.hosts';
+const SELECTED_HOST_KEY = 'wireguard.selectedHost';
 const PROFILE_KEY = 'wireguard.profile';
 
 type ConnectionState = 'idle' | 'fetching' | 'ready' | 'connecting' | 'connected' | 'disconnected' | 'error';
@@ -45,7 +52,8 @@ type ConnectionState = 'idle' | 'fetching' | 'ready' | 'connecting' | 'connected
 export default function HomeScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const [endpoint, setEndpoint] = useState('');
+  const [host, setHost] = useState('');
+  const [savedHosts, setSavedHosts] = useState<string[]>([]);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [profile, setProfile] = useState<WireGuardConfig | null>(null);
@@ -57,9 +65,27 @@ export default function HomeScreen() {
     let mounted = true;
     const restoreSavedState = async () => {
       try {
-        const [savedEndpoint, savedProfile] = await Promise.all([readLocal(ENDPOINT_KEY), readLocal(PROFILE_KEY)]);
+        const [storedHosts, selectedHost, legacyEndpoint, savedProfile] = await Promise.all([
+          readLocal(HOSTS_KEY),
+          readLocal(SELECTED_HOST_KEY),
+          readLocal(LEGACY_ENDPOINT_KEY),
+          readLocal(PROFILE_KEY),
+        ]);
         if (!mounted) return;
-        if (savedEndpoint) setEndpoint(savedEndpoint);
+        const restoredHosts = parseStoredHosts(storedHosts);
+        const migratedHost = normalizeProfileHost(selectedHost || legacyEndpoint || '');
+        const nextHosts = migratedHost && !restoredHosts.includes(migratedHost)
+          ? [migratedHost, ...restoredHosts]
+          : restoredHosts;
+        setSavedHosts(nextHosts);
+        setHost(migratedHost || nextHosts[0] || '');
+        if (migratedHost) {
+          await Promise.all([
+            writeLocal(HOSTS_KEY, JSON.stringify(nextHosts)),
+            writeLocal(SELECTED_HOST_KEY, migratedHost),
+            removeLocal(LEGACY_ENDPOINT_KEY),
+          ]);
+        }
         if (savedProfile) {
           try {
             setProfile(parseStoredWireGuardProfile(savedProfile));
@@ -75,23 +101,85 @@ export default function HomeScreen() {
             }
           }
         }
+        const status = await getNativeTunnelStatus();
+        if (mounted && status?.isConnected) setState('connected');
       } catch {
         if (mounted) setMessage('Could not load the saved profile from this device.');
       }
     };
     restoreSavedState();
-    getNativeTunnelStatus().then((status) => {
-      if (mounted && status?.isConnected) setState('connected');
-    }).catch(() => undefined);
     return () => { mounted = false; };
   }, []);
 
+  useEffect(() => {
+    const syncTunnelStatus = () => {
+      getNativeTunnelStatus().then((status) => {
+        if (!status) return;
+        setState((current) => status.isConnected
+          ? 'connected'
+          : current === 'connected' || current === 'connecting'
+            ? 'disconnected'
+            : current);
+      }).catch(() => undefined);
+    };
+    const appStateSubscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') syncTunnelStatus();
+    });
+    const tunnelSubscription = subscribeToNativeTunnelStatus((status) => {
+      setState(status.isConnected ? 'connected' : status.status === 'ERROR' ? 'error' : 'disconnected');
+    });
+    return () => {
+      appStateSubscription.remove();
+      tunnelSubscription?.remove();
+    };
+  }, []);
+
   const summary = useMemo(() => (profile ? profileSummary(profile) : null), [profile]);
+  const endpointPreview = useMemo(() => {
+    try {
+      return host ? buildProfileEndpoint(host) : 'https://{host}:2083/api/v3/user/action';
+    } catch {
+      return 'Enter a valid host to build the profile URL.';
+    }
+  }, [host]);
   const isBusy = state === 'fetching' || state === 'connecting';
   const isConnected = state === 'connected';
 
+  const saveHostEntry = useCallback(async (candidate: string) => {
+    const normalizedHost = normalizeProfileHost(candidate);
+    if (!normalizedHost) {
+      setState('error');
+      setMessage('Enter a valid host name or IP address.');
+      return null;
+    }
+    const nextHosts = [normalizedHost, ...savedHosts.filter((entry) => entry !== normalizedHost)];
+    setHost(normalizedHost);
+    setSavedHosts(nextHosts);
+    await Promise.all([
+      writeLocal(HOSTS_KEY, JSON.stringify(nextHosts)),
+      writeLocal(SELECTED_HOST_KEY, normalizedHost),
+    ]);
+    return normalizedHost;
+  }, [savedHosts]);
+
+  const selectHost = useCallback(async (selectedHost: string) => {
+    setHost(selectedHost);
+    setMessage('');
+    await writeLocal(SELECTED_HOST_KEY, selectedHost);
+  }, []);
+
+  const removeHostEntry = useCallback(async (removedHost: string) => {
+    const nextHosts = savedHosts.filter((entry) => entry !== removedHost);
+    const nextSelectedHost = host === removedHost ? nextHosts[0] || '' : host;
+    setSavedHosts(nextHosts);
+    setHost(nextSelectedHost);
+    await writeLocal(HOSTS_KEY, JSON.stringify(nextHosts));
+    if (nextSelectedHost) await writeLocal(SELECTED_HOST_KEY, nextSelectedHost);
+    else await removeLocal(SELECTED_HOST_KEY);
+  }, [host, savedHosts]);
+
   const fetchProfile = useCallback(async () => {
-    const value = endpoint.trim();
+    const value = normalizeProfileHost(host);
     const validationMessage = validateProfileRequest(value, username, password);
     if (validationMessage) {
       setState('error');
@@ -105,7 +193,7 @@ export default function HomeScreen() {
         fetchImpl: fetch,
         generateKeyPair: generateWireGuardKeyPair,
       }));
-      await writeLocal(ENDPOINT_KEY, value);
+      await saveHostEntry(value);
       await writeLocal(PROFILE_KEY, JSON.stringify(validatedProfile));
       setProfile(validatedProfile);
       setLastFetched(new Date());
@@ -116,7 +204,7 @@ export default function HomeScreen() {
       setMessage(profileRequestErrorMessage(error));
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
-  }, [endpoint, password, username]);
+  }, [host, password, saveHostEntry, username]);
 
   const toggleConnection = useCallback(async () => {
     const module = getWireGuardModule();
@@ -126,6 +214,21 @@ export default function HomeScreen() {
         'The live preview cannot start a VPN tunnel. Install a development APK or production Android build with the WireGuard module enabled.',
         [{ text: 'Okay' }],
       );
+      return;
+    }
+    if (isConnected) {
+      setMessage('');
+      setState('connecting');
+      try {
+        await module.initialize();
+        await module.disconnect();
+        setState('disconnected');
+        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      } catch (error) {
+        setState('error');
+        setMessage(error instanceof Error ? error.message : 'The tunnel could not be stopped.');
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      }
       return;
     }
     if (!profile) {
@@ -148,13 +251,6 @@ export default function HomeScreen() {
     }
     setMessage('');
     try {
-      if (isConnected) {
-        setState('connecting');
-        await module.disconnect();
-        setState('disconnected');
-        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-        return;
-      }
       setState('connecting');
       await module.initialize();
       const supported = await module.isSupported();
@@ -182,15 +278,13 @@ export default function HomeScreen() {
   }, [isConnected, profile]);
 
   const clearProfile = useCallback(() => {
-    Alert.alert('Remove saved profile?', 'This clears the endpoint and private profile from this device.', [
+    Alert.alert('Remove saved profile?', 'This clears the private WireGuard profile. Saved hosts remain available.', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Remove',
         style: 'destructive',
         onPress: async () => {
-          await removeLocal(ENDPOINT_KEY);
           await removeLocal(PROFILE_KEY);
-          setEndpoint('');
           setUsername('');
           setPassword('');
           setProfile(null);
@@ -254,11 +348,11 @@ export default function HomeScreen() {
           </View>
           <Pressable
             testID="connect-button"
-            disabled={isBusy || !profile}
+            disabled={isBusy || (!profile && !isConnected)}
             onPress={toggleConnection}
             style={({ pressed }) => [
               styles.connectButton,
-              { backgroundColor: isConnected ? colors.secondary : colors.primary, opacity: pressed ? 0.82 : isBusy || !profile ? 0.45 : 1 },
+              { backgroundColor: isConnected ? colors.secondary : colors.primary, opacity: pressed ? 0.82 : isBusy || (!profile && !isConnected) ? 0.45 : 1 },
             ]}
           >
             {isBusy ? <ActivityIndicator color={isConnected ? colors.foreground : colors.primaryForeground} /> : <Feather name={isConnected ? 'power' : 'zap'} size={18} color={isConnected ? colors.foreground : colors.primaryForeground} />}
@@ -275,19 +369,46 @@ export default function HomeScreen() {
         <View style={[styles.endpointCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <View style={styles.inputLabelRow}>
             <Feather name="link" size={15} color={colors.primary} />
-            <Text style={[styles.inputLabel, { color: colors.secondaryForeground }]}>API ENDPOINT</Text>
+             <Text style={[styles.inputLabel, { color: colors.secondaryForeground }]}>API HOST</Text>
           </View>
+          {savedHosts.length > 0 ? (
+            <View style={styles.hostList}>
+              {savedHosts.map((savedHost) => (
+                <View key={savedHost} style={[styles.hostChip, { borderColor: host === savedHost ? colors.primary : colors.border }]}>
+                  <Pressable onPress={() => selectHost(savedHost)} style={styles.hostSelect}>
+                    <Feather name="server" size={13} color={host === savedHost ? colors.primary : colors.mutedForeground} />
+                    <Text numberOfLines={1} style={[styles.hostText, { color: host === savedHost ? colors.primary : colors.foreground }]}>{savedHost}</Text>
+                  </Pressable>
+                  <Pressable accessibilityLabel={`Remove ${savedHost}`} onPress={() => removeHostEntry(savedHost)} hitSlop={8}>
+                    <Feather name="x" size={14} color={colors.mutedForeground} />
+                  </Pressable>
+                </View>
+              ))}
+            </View>
+          ) : null}
+          <View style={styles.hostInputRow}>
           <TextInput
-            testID="endpoint-input"
+             testID="host-input"
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="url"
-            placeholder="https://vpn.example.com:2083/api/v3/user/action"
+             placeholder="vpn.example.com"
             placeholderTextColor={colors.mutedForeground}
-            value={endpoint}
-            onChangeText={(value) => { setEndpoint(value); if (state === 'error') setState(profile ? 'ready' : 'idle'); }}
-            style={[styles.input, { color: colors.foreground, borderColor: colors.input }]}
+             value={host}
+             onChangeText={(value) => { setHost(value); if (state === 'error') setState(profile ? 'ready' : 'idle'); }}
+             style={[styles.input, styles.hostInput, { color: colors.foreground, borderColor: colors.input }]}
           />
+            <Pressable
+              accessibilityLabel="Save host"
+              onPress={() => saveHostEntry(host)}
+              style={({ pressed }) => [styles.saveHostButton, { backgroundColor: colors.accent, opacity: pressed ? 0.7 : 1 }]}
+            >
+              <Feather name="plus" size={19} color={colors.primary} />
+            </Pressable>
+          </View>
+          <Text numberOfLines={1} style={[styles.helper, { color: colors.mutedForeground }]}>
+            {endpointPreview}
+          </Text>
           <Text style={[styles.helper, { color: colors.mutedForeground }]}>Your password is used only for this request and is never saved.</Text>
           <View style={styles.credentialsRow}>
             <View style={styles.credentialField}>
@@ -406,6 +527,13 @@ const styles = StyleSheet.create({
   sectionTitle: { fontSize: 16, fontFamily: 'Inter_700Bold' },
   sectionHint: { fontSize: 11, fontFamily: 'Inter_400Regular' },
   endpointCard: { borderRadius: 20, borderWidth: 1, padding: 16, gap: 11 },
+  hostList: { gap: 8 },
+  hostChip: { minHeight: 38, borderWidth: 1, borderRadius: 12, paddingHorizontal: 11, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  hostSelect: { flex: 1, minHeight: 38, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  hostText: { flex: 1, fontSize: 12, fontFamily: 'Inter_600SemiBold' },
+  hostInputRow: { flexDirection: 'row', alignItems: 'center', gap: 9 },
+  hostInput: { flex: 1 },
+  saveHostButton: { width: 50, height: 50, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
   inputLabelRow: { flexDirection: 'row', alignItems: 'center', gap: 7 },
   inputLabel: { fontSize: 10, letterSpacing: 1.2, fontFamily: 'Inter_700Bold' },
   input: { height: 50, borderWidth: 1, borderRadius: 13, paddingHorizontal: 14, fontSize: 14, fontFamily: 'Inter_500Medium' },

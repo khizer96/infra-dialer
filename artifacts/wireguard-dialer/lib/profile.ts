@@ -5,6 +5,7 @@ import {
 } from './wireguard.ts';
 
 export const PROFILE_REQUEST_TIMEOUT_MS = 20_000;
+export const PROFILE_ENDPOINT_TEMPLATE = 'https://{host}:2083/api/v3/user/action';
 
 export type ProfileKeyPair = {
   privateKey: string;
@@ -77,9 +78,39 @@ export class ProfileRequestError extends Error {
   }
 }
 
-export function validateProfileRequest(endpoint: string, username: string, password: string): string | null {
-  if (!/^https?:\/\/\S+$/i.test(endpoint.trim())) {
-    return 'Enter a full HTTPS endpoint, such as https://vpn.example.com/profile.';
+export function normalizeProfileHost(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+
+  try {
+    const parsed = new URL(trimmed.includes('://') ? trimmed : `https://${trimmed}`);
+    return parsed.hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+export function buildProfileEndpoint(host: string): string {
+  const normalizedHost = normalizeProfileHost(host);
+  if (!normalizedHost) throw new ProfileRequestError('Enter a valid host name or IP address.');
+  const formattedHost = normalizedHost.includes(':') ? `[${normalizedHost}]` : normalizedHost;
+  return PROFILE_ENDPOINT_TEMPLATE.replace('{host}', formattedHost);
+}
+
+export function parseStoredHosts(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return [...new Set(parsed.map((entry) => normalizeProfileHost(String(entry))).filter(Boolean))];
+  } catch {
+    return [];
+  }
+}
+
+export function validateProfileRequest(host: string, username: string, password: string): string | null {
+  if (!normalizeProfileHost(host)) {
+    return 'Enter a valid host name or IP address.';
   }
   if (!username.trim() || !password) {
     return 'Enter the username and password used by your profile service.';
@@ -96,13 +127,13 @@ export function profileRequestErrorMessage(error: unknown): string {
 }
 
 export async function requestWireGuardProfile(
-  endpoint: string,
+  host: string,
   username: string,
   password: string,
   { fetchImpl, generateKeyPair }: ProfileRequestDependencies,
 ): Promise<WireGuardConfig> {
   const keyPair = await generateKeyPair();
-  const response = await fetchImpl(endpoint, {
+  const response = await fetchImpl(buildProfileEndpoint(host), {
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -116,7 +147,7 @@ export async function requestWireGuardProfile(
 }
 
 export async function refreshWireGuardProfile(
-  endpoint: string,
+  host: string,
   username: string,
   password: string,
   {
@@ -125,14 +156,14 @@ export async function refreshWireGuardProfile(
     timeoutMs = PROFILE_REQUEST_TIMEOUT_MS,
   }: ProfileRequestDependencies & { timeoutMs?: number },
 ): Promise<WireGuardConfig> {
-  const validationMessage = validateProfileRequest(endpoint, username, password);
+  const validationMessage = validateProfileRequest(host, username, password);
   if (validationMessage) throw new ProfileRequestError(validationMessage);
 
   const keyPair = await generateKeyPair();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const profile = await requestWireGuardProfile(endpoint.trim(), username.trim(), password, {
+    const profile = await requestWireGuardProfile(host, username.trim(), password, {
       fetchImpl: (input, init) => fetchImpl(input, { ...init, signal: controller.signal }),
       generateKeyPair: async () => keyPair,
     });

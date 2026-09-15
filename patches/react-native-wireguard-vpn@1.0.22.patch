@@ -1,5 +1,19 @@
+diff --git a/android/src/main/AndroidManifest.xml b/android/src/main/AndroidManifest.xml
+index 28c1badb06df94f0d599c42ebff191ebb96bbcdb..87d251032b6ca70f14438efa83446a21c8e946e0 100644
+--- a/android/src/main/AndroidManifest.xml
++++ b/android/src/main/AndroidManifest.xml
+@@ -20,7 +20,8 @@
+         <service
+             android:name="com.wireguard.android.backend.GoBackend$VpnService"
+             android:permission="android.permission.BIND_VPN_SERVICE"
+-            android:exported="true">
++            android:exported="true"
++            android:stopWithTask="false">
+             <intent-filter>
+                 <action android:name="android.net.VpnService" />
+             </intent-filter>
 diff --git a/android/src/main/java/com/wireguardvpn/WireGuardVpnModule.kt b/android/src/main/java/com/wireguardvpn/WireGuardVpnModule.kt
-index 0379b7caecd82246c508aaae492254a089a0a672..6807d01cae679c3998116a11efef4dd87b8ef2b8 100644
+index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac38249205d 100644
 --- a/android/src/main/java/com/wireguardvpn/WireGuardVpnModule.kt
 +++ b/android/src/main/java/com/wireguardvpn/WireGuardVpnModule.kt
 @@ -1,5 +1,8 @@
@@ -11,7 +25,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..6807d01cae679c3998116a11efef4dd8
  import com.facebook.react.bridge.*
  import com.facebook.react.modules.core.DeviceEventManagerModule
  import com.wireguard.android.backend.GoBackend
-@@ -12,10 +15,21 @@ import com.wireguard.config.InetNetwork
+@@ -12,10 +15,37 @@ import com.wireguard.config.InetNetwork
  import com.wireguard.config.ParseException
  import com.wireguard.crypto.Key
  
@@ -21,6 +35,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..6807d01cae679c3998116a11efef4dd8
 +    ActivityEventListener {
 +    companion object {
 +        private const val VPN_PERMISSION_REQUEST_CODE = 42742
++        private const val TUNNEL_NAME = "WireGuardTunnel"
 +    }
 +
      private var backend: GoBackend? = null
@@ -31,10 +46,25 @@ index 0379b7caecd82246c508aaae492254a089a0a672..6807d01cae679c3998116a11efef4dd8
 +    init {
 +        reactContext.addActivityEventListener(this)
 +    }
++
++    private fun ensureBackend(): GoBackend {
++        return backend ?: GoBackend(reactApplicationContext).also { backend = it }
++    }
++
++    private fun ensureTunnel(): Tunnel {
++        return tunnel ?: object : Tunnel {
++            override fun getName(): String = TUNNEL_NAME
++            override fun onStateChange(newState: Tunnel.State) {
++                println("WireGuard tunnel state changed to: $newState")
++                val (tunnelState, simpleStatus, isConnected) = mapTunnelState(newState)
++                emitVpnState(tunnelState, simpleStatus, isConnected)
++            }
++        }.also { tunnel = it }
++    }
  
      private fun emitVpnState(tunnelState: String, status: String, isConnected: Boolean) {
          val payload = Arguments.createMap().apply {
-@@ -52,6 +66,56 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+@@ -52,10 +82,60 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
  
      override fun getName() = "WireGuardVpnModule"
  
@@ -57,7 +87,6 @@ index 0379b7caecd82246c508aaae492254a089a0a672..6807d01cae679c3998116a11efef4dd8
 +                promise.reject("VPN_PERMISSION_IN_PROGRESS", "A VPN permission request is already open")
 +                return
 +            }
-+
 +            vpnPermissionPromise = promise
 +            activity.startActivityForResult(permissionIntent, VPN_PERMISSION_REQUEST_CODE)
 +        } catch (error: Exception) {
@@ -91,3 +120,64 @@ index 0379b7caecd82246c508aaae492254a089a0a672..6807d01cae679c3998116a11efef4dd8
      @ReactMethod
      fun initialize(promise: Promise) {
          try {
+-            backend = GoBackend(reactApplicationContext)
++            ensureBackend()
++            ensureTunnel()
+             promise.resolve(null)
+         } catch (e: Exception) {
+             promise.reject("INIT_ERROR", "Failed to initialize WireGuard: ${e.message}")
+@@ -70,7 +151,7 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+             
+             if (backend == null) {
+                 println("Backend is null, initializing...")
+-                backend = GoBackend(reactApplicationContext)
++                ensureBackend()
+             }
+             
+             val interfaceBuilder = Interface.Builder()
+@@ -202,14 +283,7 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+             this.config = configBuilder.build()
+             println("WireGuard config built successfully")
+ 
+-            this.tunnel = object : Tunnel {
+-                override fun getName(): String = "WireGuardTunnel"
+-                override fun onStateChange(newState: Tunnel.State) {
+-                    println("WireGuard tunnel state changed to: $newState")
+-                    val (tunnelState, simpleStatus, isConnected) = mapTunnelState(newState)
+-                    emitVpnState(tunnelState, simpleStatus, isConnected)
+-                }
+-            }
++            ensureTunnel()
+ 
+             try {
+                 println("Checking backend and tunnel state...")
+@@ -257,12 +331,10 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+     @ReactMethod
+     fun disconnect(promise: Promise) {
+         try {
+-            if (tunnel != null && backend != null && config != null) {
+-                backend?.setState(tunnel!!, Tunnel.State.DOWN, config!!)
+-                promise.resolve(null)
+-            } else {
+-                promise.reject("DISCONNECT_ERROR", "Tunnel not initialized")
+-            }
++            val activeBackend = ensureBackend()
++            val activeTunnel = ensureTunnel()
++            activeBackend.setState(activeTunnel, Tunnel.State.DOWN, null)
++            promise.resolve(null)
+         } catch (e: Exception) {
+             promise.reject("DISCONNECT_ERROR", "Failed to disconnect: ${e.message}")
+         }
+@@ -271,11 +343,7 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+     @ReactMethod
+     fun getStatus(promise: Promise) {
+         try {
+-            val state = if (tunnel != null && backend != null) {
+-                backend?.getState(tunnel!!)
+-            } else {
+-                Tunnel.State.DOWN
+-            }
++            val state = ensureBackend().getState(ensureTunnel())
+ 
+             val stateName = state?.name ?: "UNKNOWN"
+ 

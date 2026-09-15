@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { keyPairFromSeed } from '../lib/keypair-core.ts';
 import {
+  buildProfileEndpoint,
+  normalizeProfileHost,
+  parseStoredHosts,
   profileRequestErrorMessage,
   refreshWireGuardProfile,
   requestWireGuardProfile,
@@ -13,7 +16,8 @@ import {
   validateWireGuardConfig,
 } from '../lib/wireguard.ts';
 
-const endpoint = 'https://vpn.example.com/profile';
+const host = 'vpn.example.com';
+const endpoint = 'https://vpn.example.com:2083/api/v3/user/action';
 const username = 'test-user';
 const password = 'correct horse battery staple';
 const firstKeyPair = keyPairFromSeed(new Uint8Array(32).fill(1));
@@ -52,10 +56,19 @@ function successResponse() {
   };
 }
 
+test('builds the fixed profile route from saved hosts', () => {
+  assert.equal(buildProfileEndpoint('VPN.Example.com'), endpoint);
+  assert.equal(normalizeProfileHost('https://vpn.example.com:2083/old/path'), host);
+  assert.deepEqual(
+    parseStoredHosts(JSON.stringify(['VPN.Example.com', 'vpn.example.com', '10.0.0.5'])),
+    ['vpn.example.com', '10.0.0.5'],
+  );
+});
+
 test('posts JSON credentials and a fresh 32-byte base64 public key for every request', async () => {
   const requests = [];
   const keyPairs = [firstKeyPair, secondKeyPair];
-  const result = async () => requestWireGuardProfile(endpoint, username, password, {
+  const result = async () => requestWireGuardProfile(host, username, password, {
     fetchImpl: async (input, init) => {
       requests.push({ input, init });
       return response(successResponse());
@@ -85,7 +98,7 @@ test('posts JSON credentials and a fresh 32-byte base64 public key for every req
 });
 
 test('normalizes a successful API response and preserves peer details', async () => {
-  const profile = await requestWireGuardProfile(endpoint, username, password, {
+  const profile = await requestWireGuardProfile(host, username, password, {
     fetchImpl: async () => response(successResponse()),
     generateKeyPair: async () => firstKeyPair,
   });
@@ -123,7 +136,7 @@ PersistentKeepalive = 15`,
     },
   };
 
-  const profile = await requestWireGuardProfile(endpoint, username, password, {
+  const profile = await requestWireGuardProfile(host, username, password, {
     fetchImpl: async () => response(body),
     generateKeyPair: async () => firstKeyPair,
   });
@@ -137,7 +150,7 @@ PersistentKeepalive = 15`,
 
 test('surfaces profile API rejection messages', async () => {
   await assert.rejects(
-    requestWireGuardProfile(endpoint, username, password, {
+    requestWireGuardProfile(host, username, password, {
       fetchImpl: async () => response({
         header: { code: 0, message: 'Invalid username or password.' },
       }),
@@ -224,7 +237,7 @@ function screenRefresh(initialProfile, input, dependencies) {
   };
 
   const refresh = async () => {
-    const validationMessage = validateProfileRequest(input.endpoint, input.username, input.password);
+    const validationMessage = validateProfileRequest(input.host, input.username, input.password);
     if (validationMessage) {
       screen.state = 'error';
       screen.message = validationMessage;
@@ -236,7 +249,7 @@ function screenRefresh(initialProfile, input, dependencies) {
     screen.message = '';
     try {
       screen.profile = await refreshWireGuardProfile(
-        input.endpoint,
+        input.host,
         input.username,
         input.password,
         dependencies,
@@ -256,7 +269,7 @@ function screenRefresh(initialProfile, input, dependencies) {
 
 test('covers validation and loading-to-success screen refresh states', async () => {
   const invalid = await screenRefresh(null, {
-    endpoint: 'not-an-endpoint',
+    host: 'bad host/path',
     username,
     password,
   }, {
@@ -266,12 +279,12 @@ test('covers validation and loading-to-success screen refresh states', async () 
   assert.deepEqual(invalid, {
     profile: null,
     state: 'error',
-    message: 'Enter a full HTTPS endpoint, such as https://vpn.example.com/profile.',
+    message: 'Enter a valid host name or IP address.',
     states: [],
   });
 
   const success = await screenRefresh(null, {
-    endpoint,
+    host,
     username,
     password,
   }, {
@@ -286,7 +299,7 @@ test('covers validation and loading-to-success screen refresh states', async () 
 
 test('shows HTTP failures and preserves a previously usable profile during refresh', async () => {
   const failed = await screenRefresh(savedProfile, {
-    endpoint,
+    host,
     username,
     password,
   }, {
@@ -303,7 +316,7 @@ test('shows HTTP failures and preserves a previously usable profile during refre
 test('cleans up a timed-out request and exposes a user-facing timeout message', async () => {
   let signal;
   const timedOut = await screenRefresh(savedProfile, {
-    endpoint,
+    host,
     username,
     password,
   }, {
@@ -331,7 +344,7 @@ test('cleans up a timed-out request and exposes a user-facing timeout message', 
 test('clears the timeout after a successful refresh', async () => {
   let signal;
   const refreshed = await screenRefresh(savedProfile, {
-    endpoint,
+    host,
     username,
     password,
   }, {

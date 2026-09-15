@@ -1,10 +1,10 @@
-import { NativeModules, Platform } from 'react-native';
+import { DeviceEventEmitter, NativeModules, Platform, type EmitterSubscription } from 'react-native';
 import type { WireGuardConfig } from './wireguard';
 import { removeLocal, writeLocal } from './storage';
 
 const ANDROID_VPN_CONSENT_KEY = 'wireguard.androidVpnConsent';
 
-type TunnelStatus = {
+export type TunnelStatus = {
   isConnected: boolean;
   tunnelState: string;
   status: string;
@@ -80,5 +80,11 @@ export async function ensureAndroidVpnPermission(): Promise<void> {
 export async function getNativeTunnelStatus(): Promise<TunnelStatus | null> {
   const module = getWireGuardModule();
   if (!module) return null;
+  await module.initialize();
   return module.getStatus();
+}
+
+export function subscribeToNativeTunnelStatus(listener: (status: TunnelStatus) => void): EmitterSubscription | null {
+  if (Platform.OS !== 'android' || !getWireGuardModule()) return null;
+  return DeviceEventEmitter.addListener('vpnStateChanged', listener);
 }
