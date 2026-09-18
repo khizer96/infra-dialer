@@ -2,7 +2,7 @@
   "expo": {
     "name": "Infra Dialer",
     "slug": "infradialer",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "infradialer",
@@ -13,7 +13,7 @@
     },
     "android": {
       "package": "com.infradialer.app",
-      "versionCode": 3,
+      "versionCode": 4,
       "permissions": [
         "INTERNET",
         "FOREGROUND_SERVICE",

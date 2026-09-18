@@ -14,10 +14,10 @@ index 28c1badb06df94f0d599c42ebff191ebb96bbcdb..87d251032b6ca70f14438efa83446a21
              </intent-filter>
 diff --git a/android/src/main/java/com/wireguardvpn/TrackerBlockerClient.kt b/android/src/main/java/com/wireguardvpn/TrackerBlockerClient.kt
 new file mode 100644
-index 0000000000000000000000000000000000000000..5d2082af54e4802c193e4664c23e5429944980ed
+index 0000000000000000000000000000000000000000..bf78796476e7eb3ebe11f11c42b72822a9f81564
 --- /dev/null
 +++ b/android/src/main/java/com/wireguardvpn/TrackerBlockerClient.kt
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,265 @@
 +package com.wireguardvpn
 +
 +import android.content.Context
@@ -30,6 +30,7 @@ index 0000000000000000000000000000000000000000..5d2082af54e4802c193e4664c23e5429
 +import java.net.Socket
 +import java.util.concurrent.Executors
 +import java.util.concurrent.ScheduledFuture
++import java.util.concurrent.TimeUnit
 +
 +data class TrackerBlockerStatus(
 +    val enabled: Boolean,
