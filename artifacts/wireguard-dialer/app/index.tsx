@@ -8,6 +8,7 @@ import {
   Platform,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -33,10 +34,14 @@ import {
 import {
   clearAndroidVpnPermissionCache,
   ensureAndroidVpnPermission,
+  getNativeTrackerBlockerStatus,
   getNativeTunnelStatus,
   getWireGuardModule,
   isNativeVpnPermissionError,
+  setNativeTrackerBlockerEnabled,
+  subscribeToNativeTrackerBlockerStatus,
   subscribeToNativeTunnelStatus,
+  type TrackerBlockerStatus,
   VpnPermissionError,
 } from '@/lib/tunnel';
 import { readLocal, removeLocal, writeLocal } from '@/lib/storage';
@@ -46,6 +51,12 @@ const LEGACY_ENDPOINT_KEY = 'wireguard.endpoint';
 const HOSTS_KEY = 'wireguard.hosts';
 const SELECTED_HOST_KEY = 'wireguard.selectedHost';
 const PROFILE_KEY = 'wireguard.profile';
+const EMPTY_TRACKER_STATUS: TrackerBlockerStatus = {
+  enabled: false,
+  socketConnected: false,
+  counter: null,
+  error: null,
+};
 
 type ConnectionState = 'idle' | 'fetching' | 'ready' | 'connecting' | 'connected' | 'disconnected' | 'error';
 
@@ -60,6 +71,8 @@ export default function HomeScreen() {
   const [state, setState] = useState<ConnectionState>('idle');
   const [message, setMessage] = useState('');
   const [lastFetched, setLastFetched] = useState<Date | null>(null);
+  const [trackerStatus, setTrackerStatus] = useState<TrackerBlockerStatus>(EMPTY_TRACKER_STATUS);
+  const [trackerBusy, setTrackerBusy] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -102,7 +115,11 @@ export default function HomeScreen() {
           }
         }
         const status = await getNativeTunnelStatus();
-        if (mounted && status?.isConnected) setState('connected');
+        if (mounted && status?.isConnected) {
+          setState('connected');
+          const restoredTrackerStatus = await getNativeTrackerBlockerStatus();
+          if (mounted && restoredTrackerStatus) setTrackerStatus(restoredTrackerStatus);
+        }
       } catch {
         if (mounted) setMessage('Could not load the saved profile from this device.');
       }
@@ -113,13 +130,19 @@ export default function HomeScreen() {
 
   useEffect(() => {
     const syncTunnelStatus = () => {
-      getNativeTunnelStatus().then((status) => {
+      getNativeTunnelStatus().then(async (status) => {
         if (!status) return;
         setState((current) => status.isConnected
           ? 'connected'
           : current === 'connected' || current === 'connecting'
             ? 'disconnected'
             : current);
+        if (status.isConnected) {
+          const nextTrackerStatus = await getNativeTrackerBlockerStatus();
+          if (nextTrackerStatus) setTrackerStatus(nextTrackerStatus);
+        } else {
+          setTrackerStatus(EMPTY_TRACKER_STATUS);
+        }
       }).catch(() => undefined);
     };
     const appStateSubscription = AppState.addEventListener('change', (nextState) => {
@@ -127,10 +150,13 @@ export default function HomeScreen() {
     });
     const tunnelSubscription = subscribeToNativeTunnelStatus((status) => {
       setState(status.isConnected ? 'connected' : status.status === 'ERROR' ? 'error' : 'disconnected');
+      if (!status.isConnected) setTrackerStatus(EMPTY_TRACKER_STATUS);
     });
+    const trackerSubscription = subscribeToNativeTrackerBlockerStatus(setTrackerStatus);
     return () => {
       appStateSubscription.remove();
       tunnelSubscription?.remove();
+      trackerSubscription?.remove();
     };
   }, []);
 
@@ -144,6 +170,21 @@ export default function HomeScreen() {
   }, [host]);
   const isBusy = state === 'fetching' || state === 'connecting';
   const isConnected = state === 'connected';
+
+  const toggleTrackerBlocker = useCallback(async (enabled: boolean) => {
+    setTrackerBusy(true);
+    setMessage('');
+    try {
+      const nextStatus = await setNativeTrackerBlockerEnabled(enabled);
+      setTrackerStatus(nextStatus);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'The tracker blocker command failed.');
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } finally {
+      setTrackerBusy(false);
+    }
+  }, []);
 
   const saveHostEntry = useCallback(async (candidate: string) => {
     const normalizedHost = normalizeProfileHost(candidate);
@@ -362,6 +403,47 @@ export default function HomeScreen() {
           </Pressable>
         </View>
 
+        {isConnected ? (
+          <View style={[styles.trackerCard, { backgroundColor: colors.card, borderColor: trackerStatus.enabled ? colors.primary : colors.border }]}>
+            <View style={styles.trackerHeader}>
+              <View style={[styles.trackerIcon, { backgroundColor: colors.accent }]}>
+                <Feather name="shield" size={18} color={colors.primary} />
+              </View>
+              <View style={styles.trackerCopy}>
+                <Text style={[styles.trackerTitle, { color: colors.foreground }]}>Enable tracker blocker</Text>
+                <Text style={[styles.trackerSubtitle, { color: colors.mutedForeground }]}>
+                  {trackerStatus.enabled
+                    ? trackerStatus.socketConnected ? 'Tracker and ad blocking active' : 'Reconnecting blocker service'
+                    : 'Block trackers and ads through the tunnel'}
+                </Text>
+              </View>
+              {trackerBusy ? (
+                <ActivityIndicator size="small" color={colors.primary} />
+              ) : (
+                <Switch
+                  testID="tracker-blocker-toggle"
+                  accessibilityLabel="Enable tracker blocker"
+                  value={trackerStatus.enabled}
+                  onValueChange={toggleTrackerBlocker}
+                  trackColor={{ false: colors.input, true: colors.primary }}
+                  thumbColor={trackerStatus.enabled ? colors.primaryForeground : colors.mutedForeground}
+                />
+              )}
+            </View>
+            {trackerStatus.enabled ? (
+              <View style={[styles.statsRow, { borderTopColor: colors.border }]}>
+                <Text style={[styles.statsLabel, { color: colors.mutedForeground }]}>Blocked counter</Text>
+                <Text testID="tracker-counter" style={[styles.statsValue, { color: colors.primary }]}>
+                  {trackerStatus.counter ?? '—'}
+                </Text>
+              </View>
+            ) : null}
+            {trackerStatus.error ? (
+              <Text style={[styles.trackerError, { color: colors.destructive }]}>{trackerStatus.error}</Text>
+            ) : null}
+          </View>
+        ) : null}
+
         <View style={styles.sectionHeading}>
           <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Profile API</Text>
           <Text style={[styles.sectionHint, { color: colors.mutedForeground }]}>POST credentials + public key</Text>
@@ -523,6 +605,16 @@ const styles = StyleSheet.create({
   statusSubcopy: { fontSize: 13, lineHeight: 19, fontFamily: 'Inter_400Regular' },
   connectButton: { minHeight: 52, borderRadius: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9 },
   connectLabel: { fontSize: 14, fontFamily: 'Inter_700Bold' },
+  trackerCard: { borderRadius: 20, borderWidth: 1, padding: 16, gap: 14 },
+  trackerHeader: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  trackerIcon: { width: 40, height: 40, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
+  trackerCopy: { flex: 1, gap: 3 },
+  trackerTitle: { fontSize: 14, fontFamily: 'Inter_700Bold' },
+  trackerSubtitle: { fontSize: 11, lineHeight: 16, fontFamily: 'Inter_400Regular' },
+  statsRow: { borderTopWidth: 1, paddingTop: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  statsLabel: { fontSize: 12, fontFamily: 'Inter_500Medium' },
+  statsValue: { fontSize: 20, fontFamily: 'Inter_700Bold' },
+  trackerError: { fontSize: 11, lineHeight: 16, fontFamily: 'Inter_500Medium' },
   sectionHeading: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', gap: 10, marginTop: 2 },
   sectionTitle: { fontSize: 16, fontFamily: 'Inter_700Bold' },
   sectionHint: { fontSize: 11, fontFamily: 'Inter_400Regular' },

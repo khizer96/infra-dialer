@@ -11,6 +11,13 @@ export type TunnelStatus = {
   error?: string;
 };
 
+export type TrackerBlockerStatus = {
+  enabled: boolean;
+  socketConnected: boolean;
+  counter: number | null;
+  error?: string | null;
+};
+
 type WireGuardNativeModule = {
   initialize: () => Promise<void>;
   requestVpnPermission: () => Promise<boolean>;
@@ -18,6 +25,8 @@ type WireGuardNativeModule = {
   disconnect: () => Promise<void>;
   getStatus: () => Promise<TunnelStatus>;
   isSupported: () => Promise<boolean>;
+  getTrackerBlockerStatus: () => Promise<TrackerBlockerStatus>;
+  setTrackerBlockerEnabled: (enabled: boolean) => Promise<TrackerBlockerStatus>;
 };
 
 export class VpnPermissionError extends Error {
@@ -87,4 +96,25 @@ export async function getNativeTunnelStatus(): Promise<TunnelStatus | null> {
 export function subscribeToNativeTunnelStatus(listener: (status: TunnelStatus) => void): EmitterSubscription | null {
   if (Platform.OS !== 'android' || !getWireGuardModule()) return null;
   return DeviceEventEmitter.addListener('vpnStateChanged', listener);
+}
+
+export async function getNativeTrackerBlockerStatus(): Promise<TrackerBlockerStatus | null> {
+  const module = getWireGuardModule();
+  if (!module?.getTrackerBlockerStatus) return null;
+  return module.getTrackerBlockerStatus();
+}
+
+export async function setNativeTrackerBlockerEnabled(enabled: boolean): Promise<TrackerBlockerStatus> {
+  const module = getWireGuardModule();
+  if (!module?.setTrackerBlockerEnabled) {
+    throw new Error('This Android build does not include tracker blocker support. Rebuild and reinstall the app.');
+  }
+  return module.setTrackerBlockerEnabled(enabled);
+}
+
+export function subscribeToNativeTrackerBlockerStatus(
+  listener: (status: TrackerBlockerStatus) => void,
+): EmitterSubscription | null {
+  if (Platform.OS !== 'android' || !getWireGuardModule()) return null;
+  return DeviceEventEmitter.addListener('trackerBlockerStateChanged', listener);
 }

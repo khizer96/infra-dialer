@@ -32,7 +32,7 @@ Always run `pnpm install` after pulling. It applies the checked-in patches for t
 
 The current Android release version is stored in `artifacts/wireguard-dialer/app.json`:
 
-- `expo.version` is the user-visible semantic version, such as `1.1.0`.
+- `expo.version` is the user-visible semantic version, such as `1.2.0`.
 - `expo.android.versionCode` is Android's internal monotonically increasing build number.
 
 Gradle reads both values directly from `app.json`, so they cannot drift from the Expo configuration.
@@ -40,13 +40,13 @@ Gradle reads both values directly from `app.json`, so they cannot drift from the
 Before distributing each new change, choose one version command:
 
 ```bash
-# Bug fix: 1.1.0 -> 1.1.1
+# Bug fix: 1.2.0 -> 1.2.1
 pnpm --filter @workspace/wireguard-dialer run version:patch
 
-# Backward-compatible feature: 1.1.0 -> 1.2.0
+# Backward-compatible feature: 1.2.0 -> 1.3.0
 pnpm --filter @workspace/wireguard-dialer run version:minor
 
-# Breaking release: 1.1.0 -> 2.0.0
+# Breaking release: 1.2.0 -> 2.0.0
 pnpm --filter @workspace/wireguard-dialer run version:major
 ```
 
@@ -119,14 +119,17 @@ After installing:
 2. Add or select a profile host.
 3. Fetch a profile and approve the Android VPN prompt.
 4. Confirm the tunnel connects and Android shows its VPN indicator.
-5. Background and reopen the app; it should still show **Tunnel active**.
-6. Swipe the app away and reopen it; an active adapter should still be detected.
-7. Tap **Disconnect tunnel** and confirm the Android VPN indicator disappears.
+5. Enable **Tracker blocker** and confirm the blocked counter appears.
+6. Wait at least 10 seconds and confirm the counter remains available after a stats refresh.
+7. Background and reopen the app; it should still show **Tunnel active** and restore the tracker-blocker state.
+8. Swipe the app away and reopen it; the active adapter and enabled tracker blocker should still be detected.
+9. Disable **Tracker blocker** and confirm the control switches off.
+10. Tap **Disconnect tunnel** and confirm the Android VPN indicator disappears.
 
 For native failures, capture:
 
 ```bash
-adb logcat -d | grep -E "WireGuard|GoBackend|WireGuardVpnModule|AndroidRuntime"
+adb logcat -d | grep -E "WireGuard|GoBackend|WireGuardVpnModule|TrackerBlocker|AndroidRuntime"
 ```
 
 ## Signing warning

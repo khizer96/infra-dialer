@@ -12,8 +12,279 @@ index 28c1badb06df94f0d599c42ebff191ebb96bbcdb..87d251032b6ca70f14438efa83446a21
              <intent-filter>
                  <action android:name="android.net.VpnService" />
              </intent-filter>
+diff --git a/android/src/main/java/com/wireguardvpn/TrackerBlockerClient.kt b/android/src/main/java/com/wireguardvpn/TrackerBlockerClient.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d2082af54e4802c193e4664c23e5429944980ed
+--- /dev/null
++++ b/android/src/main/java/com/wireguardvpn/TrackerBlockerClient.kt
+@@ -0,0 +1,264 @@
++package com.wireguardvpn
++
++import android.content.Context
++import org.json.JSONObject
++import java.io.BufferedReader
++import java.io.BufferedWriter
++import java.io.InputStreamReader
++import java.io.OutputStreamWriter
++import java.net.InetSocketAddress
++import java.net.Socket
++import java.util.concurrent.Executors
++import java.util.concurrent.ScheduledFuture
++
++data class TrackerBlockerStatus(
++    val enabled: Boolean,
++    val socketConnected: Boolean,
++    val counter: Int?,
++    val error: String?
++)
++
++/**
++ * Owns the tracker-blocker TCP session outside the React module lifecycle.
++ * The native executor keeps polling while the Android process is retained by
++ * the active WireGuard VPN service, even when the React Native UI is destroyed.
++ */
++object TrackerBlockerClient {
++    private const val HOST = "172.30.0.5"
++    private const val PORT = 431
++    private const val CONNECT_TIMEOUT_MS = 4_000
++    private const val READ_TIMEOUT_MS = 4_000
++    private const val POLL_INTERVAL_SECONDS = 10L
++    private const val PREFS_NAME = "wireguard_tracker_blocker"
++    private const val ENABLED_KEY = "enabled"
++
++    private val executor = Executors.newSingleThreadScheduledExecutor()
++
++    @Volatile private var socket: Socket? = null
++    @Volatile private var reader: BufferedReader? = null
++    @Volatile private var writer: BufferedWriter? = null
++    @Volatile private var counter: Int? = null
++    @Volatile private var lastError: String? = null
++    @Volatile private var listener: ((TrackerBlockerStatus) -> Unit)? = null
++    @Volatile private var listenerOwner: Any? = null
++    private var pollTask: ScheduledFuture<*>? = null
++    private var enabledAppliedToSocket = false
++
++    @Synchronized
++    fun setListener(owner: Any, nextListener: (TrackerBlockerStatus) -> Unit) {
++        listenerOwner = owner
++        listener = nextListener
++    }
++
++    @Synchronized
++    fun removeListener(owner: Any) {
++        if (listenerOwner === owner) {
++            listenerOwner = null
++            listener = null
++        }
++    }
++
++    fun getStatus(context: Context): TrackerBlockerStatus {
++        return snapshot(context)
++    }
++
++    fun ensureRunning(context: Context) {
++        if (!isEnabled(context)) return
++        startPolling(context.applicationContext)
++    }
++
++    fun enable(
++        context: Context,
++        onSuccess: (TrackerBlockerStatus) -> Unit,
++        onError: (Exception) -> Unit
++    ) {
++        val appContext = context.applicationContext
++        executor.execute {
++            try {
++                ensureConnected()
++                val response = sendCommand("set:tb:1:ad:1")
++                requireSuccess(response, "enable")
++                enabledAppliedToSocket = true
++                setEnabled(appContext, true)
++                lastError = null
++                startPolling(appContext)
++                val status = snapshot(appContext)
++                notifyStatus(appContext)
++                onSuccess(status)
++            } catch (error: Exception) {
++                lastError = error.message ?: "Could not enable tracker blocker"
++                closeSocket()
++                notifyStatus(appContext)
++                onError(error)
++            }
++        }
++    }
++
++    fun disable(
++        context: Context,
++        onSuccess: (TrackerBlockerStatus) -> Unit,
++        onError: (Exception) -> Unit
++    ) {
++        val appContext = context.applicationContext
++        executor.execute {
++            try {
++                ensureConnected()
++                val response = sendCommand("set:tb:0:ad:0")
++                requireSuccess(response, "disable")
++                sendQuit()
++                setEnabled(appContext, false)
++                counter = null
++                lastError = null
++                stopPolling()
++                closeSocket()
++                val status = snapshot(appContext)
++                notifyStatus(appContext)
++                onSuccess(status)
++            } catch (error: Exception) {
++                lastError = error.message ?: "Could not disable tracker blocker"
++                closeSocket()
++                notifyStatus(appContext)
++                onError(error)
++            }
++        }
++    }
++
++    fun stopForTunnelDisconnect(context: Context, onComplete: () -> Unit) {
++        val appContext = context.applicationContext
++        executor.execute {
++            try {
++                if (isEnabled(appContext)) {
++                    ensureReady(appContext)
++                    requireSuccess(sendCommand("set:tb:0:ad:0"), "disable")
++                    sendQuit()
++                }
++            } catch (error: Exception) {
++                lastError = error.message ?: "Could not disable tracker blocker before disconnecting"
++            } finally {
++                setEnabled(appContext, false)
++                counter = null
++                stopPolling()
++                closeSocket()
++                notifyStatus(appContext)
++                onComplete()
++            }
++        }
++    }
++
++    private fun startPolling(context: Context) {
++        if (pollTask?.isCancelled == false && pollTask?.isDone == false) return
++        pollTask = executor.scheduleWithFixedDelay({
++            if (!isEnabled(context)) return@scheduleWithFixedDelay
++            try {
++                ensureReady(context)
++                val response = sendCommand("get:stats")
++                requireSuccess(response, "read stats")
++                val body = response.optJSONObject("body")
++                    ?: throw IllegalStateException("Stats response did not contain a body")
++                if (!body.has("counter")) {
++                    throw IllegalStateException("Stats response did not contain a counter")
++                }
++                counter = body.getInt("counter")
++                lastError = null
++            } catch (error: Exception) {
++                lastError = error.message ?: "Could not refresh tracker blocker stats"
++                closeSocket()
++            }
++            notifyStatus(context)
++        }, 0, POLL_INTERVAL_SECONDS, TimeUnit.SECONDS)
++    }
++
++    private fun stopPolling() {
++        pollTask?.cancel(false)
++        pollTask = null
++    }
++
++    private fun ensureConnected() {
++        if (socket?.isConnected == true && socket?.isClosed == false) return
++        closeSocket()
++        val nextSocket = Socket()
++        nextSocket.connect(InetSocketAddress(HOST, PORT), CONNECT_TIMEOUT_MS)
++        nextSocket.soTimeout = READ_TIMEOUT_MS
++        socket = nextSocket
++        reader = BufferedReader(InputStreamReader(nextSocket.getInputStream(), Charsets.UTF_8))
++        writer = BufferedWriter(OutputStreamWriter(nextSocket.getOutputStream(), Charsets.UTF_8))
++        enabledAppliedToSocket = false
++    }
++
++    private fun ensureReady(context: Context) {
++        ensureConnected()
++        if (isEnabled(context) && !enabledAppliedToSocket) {
++            requireSuccess(sendCommand("set:tb:1:ad:1"), "restore")
++            enabledAppliedToSocket = true
++        }
++    }
++
++    private fun sendCommand(command: String): JSONObject {
++        val activeWriter = writer ?: throw IllegalStateException("Tracker blocker socket is not connected")
++        val activeReader = reader ?: throw IllegalStateException("Tracker blocker socket is not connected")
++        activeWriter.write(command)
++        activeWriter.newLine()
++        activeWriter.flush()
++
++        repeat(4) {
++            val line = activeReader.readLine()
++                ?: throw IllegalStateException("Tracker blocker socket closed before responding")
++            val trimmed = line.trim()
++            if (trimmed.startsWith("{")) {
++                return JSONObject(trimmed)
++            }
++        }
++        throw IllegalStateException("Tracker blocker returned an invalid response")
++    }
++
++    private fun sendQuit() {
++        try {
++            writer?.write("quit")
++            writer?.newLine()
++            writer?.flush()
++        } catch (_: Exception) {
++            // The blocker state was already disabled; the socket is closed below.
++        }
++    }
++
++    private fun requireSuccess(response: JSONObject, action: String) {
++        if (!response.optString("status").equals("success", ignoreCase = true)) {
++            throw IllegalStateException("Tracker blocker could not $action")
++        }
++    }
++
++    private fun closeSocket() {
++        try { reader?.close() } catch (_: Exception) {}
++        try { writer?.close() } catch (_: Exception) {}
++        try { socket?.close() } catch (_: Exception) {}
++        reader = null
++        writer = null
++        socket = null
++        enabledAppliedToSocket = false
++    }
++
++    private fun isEnabled(context: Context): Boolean {
++        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++            .getBoolean(ENABLED_KEY, false)
++    }
++
++    private fun setEnabled(context: Context, enabled: Boolean) {
++        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++            .edit()
++            .putBoolean(ENABLED_KEY, enabled)
++            .apply()
++    }
++
++    private fun snapshot(context: Context): TrackerBlockerStatus {
++        return TrackerBlockerStatus(
++            enabled = isEnabled(context),
++            socketConnected = socket?.isConnected == true && socket?.isClosed == false,
++            counter = counter,
++            error = lastError
++        )
++    }
++
++    private fun notifyStatus(context: Context) {
++        listener?.invoke(snapshot(context))
++    }
++}
+\ No newline at end of file
 diff --git a/android/src/main/java/com/wireguardvpn/WireGuardVpnModule.kt b/android/src/main/java/com/wireguardvpn/WireGuardVpnModule.kt
-index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac38249205d 100644
+index 0379b7caecd82246c508aaae492254a089a0a672..f81099b97189c3720ea2ab8031a1c65dee7a2209 100644
 --- a/android/src/main/java/com/wireguardvpn/WireGuardVpnModule.kt
 +++ b/android/src/main/java/com/wireguardvpn/WireGuardVpnModule.kt
 @@ -1,5 +1,8 @@
@@ -25,7 +296,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
  import com.facebook.react.bridge.*
  import com.facebook.react.modules.core.DeviceEventManagerModule
  import com.wireguard.android.backend.GoBackend
-@@ -12,10 +15,37 @@ import com.wireguard.config.InetNetwork
+@@ -12,10 +15,38 @@ import com.wireguard.config.InetNetwork
  import com.wireguard.config.ParseException
  import com.wireguard.crypto.Key
  
@@ -45,6 +316,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
 +
 +    init {
 +        reactContext.addActivityEventListener(this)
++        TrackerBlockerClient.setListener(this, ::emitTrackerBlockerState)
 +    }
 +
 +    private fun ensureBackend(): GoBackend {
@@ -64,7 +336,36 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
  
      private fun emitVpnState(tunnelState: String, status: String, isConnected: Boolean) {
          val payload = Arguments.createMap().apply {
-@@ -52,10 +82,60 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+@@ -28,6 +59,28 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+             .emit("vpnStateChanged", payload)
+     }
+
++    private fun emitTrackerBlockerState(status: TrackerBlockerStatus) {
++        if (!reactApplicationContext.hasActiveReactInstance()) return
++        val payload = Arguments.createMap().apply {
++            putBoolean("enabled", status.enabled)
++            putBoolean("socketConnected", status.socketConnected)
++            if (status.counter == null) putNull("counter") else putInt("counter", status.counter)
++            if (status.error == null) putNull("error") else putString("error", status.error)
++        }
++        reactApplicationContext
++            .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
++            .emit("trackerBlockerStateChanged", payload)
++    }
++
++    private fun trackerBlockerStatusMap(status: TrackerBlockerStatus): WritableMap {
++        return Arguments.createMap().apply {
++            putBoolean("enabled", status.enabled)
++            putBoolean("socketConnected", status.socketConnected)
++            if (status.counter == null) putNull("counter") else putInt("counter", status.counter)
++            if (status.error == null) putNull("error") else putString("error", status.error)
++        }
++    }
++
+     private fun mapTunnelState(newState: Tunnel.State): Triple<String, String, Boolean> {
+         val stateName = newState?.name ?: "UNKNOWN"
+         val tunnelState = when {
+@@ -52,10 +105,61 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
  
      override fun getName() = "WireGuardVpnModule"
  
@@ -112,6 +413,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
 +
 +    override fun invalidate() {
 +        reactApplicationContext.removeActivityEventListener(this)
++        TrackerBlockerClient.removeListener(this)
 +        vpnPermissionPromise?.reject("VPN_PERMISSION_CANCELLED", "VPN permission request was cancelled")
 +        vpnPermissionPromise = null
 +        super.invalidate()
@@ -126,7 +428,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
              promise.resolve(null)
          } catch (e: Exception) {
              promise.reject("INIT_ERROR", "Failed to initialize WireGuard: ${e.message}")
-@@ -70,7 +151,7 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+@@ -70,7 +174,7 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
              
              if (backend == null) {
                  println("Backend is null, initializing...")
@@ -135,7 +437,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
              }
              
              val interfaceBuilder = Interface.Builder()
-@@ -202,14 +283,7 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+@@ -202,14 +306,7 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
              this.config = configBuilder.build()
              println("WireGuard config built successfully")
  
@@ -151,7 +453,7 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
  
              try {
                  println("Checking backend and tunnel state...")
-@@ -257,12 +331,10 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+@@ -257,11 +354,15 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
      @ReactMethod
      fun disconnect(promise: Promise) {
          try {
@@ -160,15 +462,19 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
 -                promise.resolve(null)
 -            } else {
 -                promise.reject("DISCONNECT_ERROR", "Tunnel not initialized")
--            }
-+            val activeBackend = ensureBackend()
-+            val activeTunnel = ensureTunnel()
-+            activeBackend.setState(activeTunnel, Tunnel.State.DOWN, null)
-+            promise.resolve(null)
++            TrackerBlockerClient.stopForTunnelDisconnect(reactApplicationContext) {
++                try {
++                    val activeBackend = ensureBackend()
++                    val activeTunnel = ensureTunnel()
++                    activeBackend.setState(activeTunnel, Tunnel.State.DOWN, null)
++                    promise.resolve(null)
++                } catch (error: Exception) {
++                    promise.reject("DISCONNECT_ERROR", "Failed to disconnect: ${error.message}", error)
++                }
+             }
          } catch (e: Exception) {
              promise.reject("DISCONNECT_ERROR", "Failed to disconnect: ${e.message}")
-         }
-@@ -271,11 +343,7 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+@@ -271,10 +372,9 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
      @ReactMethod
      fun getStatus(promise: Promise) {
          try {
@@ -176,8 +482,58 @@ index 0379b7caecd82246c508aaae492254a089a0a672..571c9586aa0979b09791bf7203abbac3
 -                backend?.getState(tunnel!!)
 -            } else {
 -                Tunnel.State.DOWN
--            }
 +            val state = ensureBackend().getState(ensureTunnel())
++            if (state == Tunnel.State.UP) {
++                TrackerBlockerClient.ensureRunning(reactApplicationContext)
+             }
  
              val stateName = state?.name ?: "UNKNOWN"
+@@ -316,6 +416,48 @@ class WireGuardVpnModule(reactContext: ReactApplicationContext) : ReactContextBa
+         }
+     }
  
++    @ReactMethod
++    fun getTrackerBlockerStatus(promise: Promise) {
++        try {
++            val tunnelState = ensureBackend().getState(ensureTunnel())
++            if (tunnelState == Tunnel.State.UP) {
++                TrackerBlockerClient.ensureRunning(reactApplicationContext)
++            }
++            promise.resolve(trackerBlockerStatusMap(TrackerBlockerClient.getStatus(reactApplicationContext)))
++        } catch (error: Exception) {
++            promise.reject("TRACKER_BLOCKER_STATUS_ERROR", "Could not read tracker blocker status: ${error.message}", error)
++        }
++    }
++
++    @ReactMethod
++    fun setTrackerBlockerEnabled(enabled: Boolean, promise: Promise) {
++        try {
++            val tunnelState = ensureBackend().getState(ensureTunnel())
++            if (tunnelState != Tunnel.State.UP) {
++                promise.reject("TRACKER_BLOCKER_TUNNEL_REQUIRED", "Connect the VPN tunnel before changing tracker blocker settings")
++                return
++            }
++
++            val resolve: (TrackerBlockerStatus) -> Unit = { status ->
++                promise.resolve(trackerBlockerStatusMap(status))
++            }
++            val reject: (Exception) -> Unit = { error ->
++                promise.reject(
++                    "TRACKER_BLOCKER_ERROR",
++                    error.message ?: "Tracker blocker command failed",
++                    error
++                )
++            }
++            if (enabled) {
++                TrackerBlockerClient.enable(reactApplicationContext, resolve, reject)
++            } else {
++                TrackerBlockerClient.disable(reactApplicationContext, resolve, reject)
++            }
++        } catch (error: Exception) {
++            promise.reject("TRACKER_BLOCKER_ERROR", "Tracker blocker command failed: ${error.message}", error)
++        }
++    }
++
+     @ReactMethod
+     fun isSupported(promise: Promise) {
+         promise.resolve(true)
