@@ -1,3 +1,4 @@
 - [Android VPN consent](android-vpn-consent.md) — cached consent is only an optimization; native permission failures must invalidate it after Settings revocation.
 - [Android tunnel lifecycle](android-tunnel-lifecycle.md) — use a stable tunnel name and query native state on resume so foreground connections survive UI recreation.
 - [Expo publish startup](expo-publish-startup.md) — run the dependency-free mobile production server directly because publish-time package pruning can break pnpm-mediated startup.
+- [Tracker blocker lifecycle](tracker-blocker-lifecycle.md) — keep blocker TCP state native, serialized, and independent of React UI teardown while the VPN remains active.
